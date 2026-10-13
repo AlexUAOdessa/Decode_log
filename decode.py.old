@@ -1,0 +1,118 @@
+import glob
+import os
+import re
+
+# Словарь управляющих ASCII-символов
+CONTROL_CODES = {
+    0x00: "NUL", 0x01: "SOH", 0x02: "STX", 0x03: "ETX", 0x04: "EOT", 0x05: "ENQ",
+    0x06: "ACK", 0x07: "BEL", 0x08: "BS",  0x09: "HT",  0x0A: "LF",  0x0B: "VT",
+    0x0C: "FF",  0x0D: "CR",  0x0E: "SO",  0x0F: "SI",  0x10: "DLE", 0x11: "DC1",
+    0x12: "DC2", 0x13: "DC3", 0x14: "DC4", 0x15: "NAK", 0x16: "SYN", 0x17: "ETB",
+    0x18: "CAN", 0x19: "EM",  0x1A: "SUB", 0x1B: "ESC", 0x1C: "FS",  0x1D: "GS",
+    0x1E: "RS",  0x1F: "US"
+}
+
+def smart_decode_data_compact(match):
+    data_content = match.group(1)
+    tokens = data_content.strip().split()
+    
+    decoded = []
+    for t in tokens:
+        if t.startswith("0x") or t.startswith("0X"):
+            try:
+                val = int(t, 16)
+                if val in CONTROL_CODES:
+                    decoded.append(f"<{CONTROL_CODES[val]}>")
+                elif val == 0x20:
+                    decoded.append(" ")
+                elif 32 <= val <= 126:
+                    decoded.append(chr(val))
+                else:
+                    c = bytes([val]).decode('cp866')
+                    if c.isprintable():
+                        decoded.append(c)
+                    else:
+                        decoded.append(f"[{t}]")
+            except:
+                decoded.append(t)
+        else:
+            decoded.append(t)
+            
+    # Компактная сборка без лишних пробелов вокруг тегов
+    output = []
+    current_word = []
+    
+    for item in decoded:
+        if item == " ":
+            if current_word:
+                output.append("".join(current_word))
+                current_word = []
+            output.append(" ")
+        elif item.startswith("<") and item.endswith(">"):
+            if current_word:
+                output.append("".join(current_word))
+                current_word = []
+            output.append(item)  # Добавляем тег напрямую без отступов
+        else:
+            if len(item) == 1:
+                current_word.append(item)
+            else:
+                if current_word:
+                    output.append("".join(current_word))
+                    current_word = []
+                output.append(item)
+                
+    if current_word:
+        output.append("".join(current_word))
+        
+    return "Data: " + "".join(output)
+
+def process_logs():
+    input_dir = "log"
+    output_dir = "decode_log"
+    
+    os.makedirs(input_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    search_path = os.path.join(input_dir, "*.log")
+    log_files = glob.glob(search_path)
+    
+    if not log_files:
+        print(f"В папке '{input_dir}' не найдено файлов с расширением .log.")
+        return
+
+    print(f"Найдено лог-файлов для обработки: {len(log_files)}")
+
+    for filepath in log_files:
+        filename = os.path.basename(filepath)
+        print(f"Обработка файла: {filename}...")
+        
+        base_name, ext = os.path.splitext(filename)
+        output_filepath = os.path.join(output_dir, f"{base_name}_decoded{ext}")
+
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+
+            new_lines = []
+            for line in lines:
+                if "Data:" in line:
+                    processed_line = re.sub(
+                        r'Data:\s*(0x[0-9A-Fa-f]{2}(\s+0x[0-9A-Fa-f]{2})*)', 
+                        smart_decode_data_compact, 
+                        line
+                    )
+                    new_lines.append(processed_line)
+                else:
+                    new_lines.append(line)
+
+            with open(output_filepath, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+                
+            print(f" -> Успешно сохранено в: {output_filepath}")
+            
+        except Exception as e:
+            print(f"Ошибка при обработке файла {filename}: {e}")
+
+if __name__ == "__main__":
+    process_logs()

@@ -2,43 +2,47 @@ import glob
 import os
 import re
 
-# Словарь управляющих ASCII-символов
-CONTROL_CODES = {
-    0x00: "NUL", 0x01: "SOH", 0x02: "STX", 0x03: "ETX", 0x04: "EOT", 0x05: "ENQ",
-    0x06: "ACK", 0x07: "BEL", 0x08: "BS",  0x09: "HT",  0x0A: "LF",  0x0B: "VT",
-    0x0C: "FF",  0x0D: "CR",  0x0E: "SO",  0x0F: "SI",  0x10: "DLE", 0x11: "DC1",
-    0x12: "DC2", 0x13: "DC3", 0x14: "DC4", 0x15: "NAK", 0x16: "SYN", 0x17: "ETB",
-    0x18: "CAN", 0x19: "EM",  0x1A: "SUB", 0x1B: "ESC", 0x1C: "FS",  0x1D: "GS",
-    0x1E: "RS",  0x1F: "US"
-}
-
-def smart_decode_data_compact(match):
+def smart_decode_data_with_block_size(match):
     data_content = match.group(1)
     tokens = data_content.strip().split()
     
+    total_bytes = len(tokens)
+    
+    # Обрезаем хвостики из пустых нулей/паддинга для чистоты текста
+    last_meaningful_idx = total_bytes - 1
+    while last_meaningful_idx >= 0:
+        t = tokens[last_meaningful_idx]
+        if t.lower() in ["0x00", "0x0ff", "0xff"]:
+            last_meaningful_idx -= 1
+        else:
+            break
+            
+    filled_bytes = max(0, last_meaningful_idx + 1)
+    meaningful_tokens = tokens[:filled_bytes] if filled_bytes > 0 else tokens
+    
     decoded = []
-    for t in tokens:
+    for t in meaningful_tokens:
         if t.startswith("0x") or t.startswith("0X"):
             try:
                 val = int(t, 16)
-                if val in CONTROL_CODES:
-                    decoded.append(f"<{CONTROL_CODES[val]}>")
-                elif val == 0x20:
+                if val == 0x20:
                     decoded.append(" ")
                 elif 32 <= val <= 126:
                     decoded.append(chr(val))
-                else:
+                elif val > 127:
                     c = bytes([val]).decode('cp866')
                     if c.isprintable():
                         decoded.append(c)
                     else:
-                        decoded.append(f"[{t}]")
+                        decoded.append(t)
+                else:
+                    decoded.append(t)
             except:
                 decoded.append(t)
         else:
             decoded.append(t)
             
-    # Компактная сборка без лишних пробелов вокруг тегов
+    # Сборка текста
     output = []
     current_word = []
     
@@ -48,11 +52,11 @@ def smart_decode_data_compact(match):
                 output.append("".join(current_word))
                 current_word = []
             output.append(" ")
-        elif item.startswith("<") and item.endswith(">"):
+        elif item.startswith("0x") or item.startswith("0X"):
             if current_word:
                 output.append("".join(current_word))
                 current_word = []
-            output.append(item)  # Добавляем тег напрямую без отступов
+            output.append(f" {item} ")
         else:
             if len(item) == 1:
                 current_word.append(item)
@@ -60,12 +64,18 @@ def smart_decode_data_compact(match):
                 if current_word:
                     output.append("".join(current_word))
                     current_word = []
-                output.append(item)
+                output.append(f" {item} ")
                 
     if current_word:
         output.append("".join(current_word))
         
-    return "Data: " + "".join(output)
+    result_str = "".join(output)
+    result_str = re.sub(r'\s+', ' ', result_str).strip()
+    
+    # Выводим только размер блока
+    stats_info = f"[Размер блока: {total_bytes}б]"
+    
+    return f"Data: {result_str}  {stats_info}"
 
 def process_logs():
     input_dir = "log"
@@ -99,7 +109,7 @@ def process_logs():
                 if "Data:" in line:
                     processed_line = re.sub(
                         r'Data:\s*(0x[0-9A-Fa-f]{2}(\s+0x[0-9A-Fa-f]{2})*)', 
-                        smart_decode_data_compact, 
+                        smart_decode_data_with_block_size, 
                         line
                     )
                     new_lines.append(processed_line)

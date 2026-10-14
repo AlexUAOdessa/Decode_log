@@ -1,61 +1,75 @@
+// Декодер логов ІКС-Е810Т / ЕП-12 (EP-08).
+// Формат вывода: исходная строка + расшифровка под ней с «|».
+//
+// Протокол: DLE=0x10, STX=0x02, ETX=0x03, ACK=0x06, SYN=0x16, NAK=0x15.
+// Текст: CP866.
+//
+// Запуск:
+//
+//	go run . file.log
+//	go run .              # все *.log в cwd / log/
 package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
-
-	"golang.org/x/text/encoding/charmap"
+	"unicode"
+	"unicode/utf8"
 )
 
-// ========================= Справочник команд =========================
+// ========================= Справочники =========================
 
-var CmdNames = map[int]string{
+var cmdNames = map[int]string{
 	0:  "SendStatus — прочитать состояние регистратора",
 	1:  "OpenShift — открытие смены",
 	2:  "CloseShift — закрытие смены",
-	9:  "DayReport — X-отчёт (дневной без обнуления)",
+	9:  "DayReport — X-отчёт",
 	10: "ArtReport — отчёт по артикулам",
 	11: "Comment — строка комментария / текст на чек",
-	12: "Sale — регистрация продажи (товар/услуга)",
-	13: "DayClrReport — Z-отчёт (дневной с обнулением)",
-	14: "Payment — оплата (наличные/карта/…)",
-	15: "CancelCheck — аннулирование / отмена чека",
-	16: "Avans — служебный внос (внесение наличных)",
-	17: "PeriodicReport — периодический отчёт из ФП",
-	18: "Sale — регистрация продажи (товар/услуга)",
-	20: "Payment — оплата (наличные/карта/…)",
-	21: "Fiscalization — фискализация ЭККР",
-	22: "SetHeadLine — атрибуты налогоплательщика / заголовок",
+	12: "Sale — регистрация продажи",
+	13: "DayClrReport — Z-отчёт",
+	14: "Payment — оплата",
+	15: "CancelCheck / ResetOrder — отмена/обнуление чека",
+	16: "Avans — служебный внос",
+	17: "PeriodicReport — периодический отчёт",
+	18: "Sale — регистрация продажи",
+	20: "Payment — оплата / закрытие чека",
+	21: "Fiscalization — фискализация",
+	22: "SetHeadLine — атрибуты / заголовок",
 	23: "Discount — скидка или наценка",
-	25: "SetTaxRate — установка налоговых ставок",
-	26: "PeriodicReportShort — короткий периодический отчёт",
-	27: "DisplayText — текст на индикатор / дисплей",
-	28: "GetTime — прочитать дату/время",
+	24: "ServiceOut — служебная выдача",
+	25: "SetTaxRate — налоговые ставки",
+	26: "PeriodicReportShort — короткий периодический",
+	27: "DisplayText — текст на индикатор",
+	28: "GetTime — дата/время",
 	29: "SetTime — установить дату/время",
-	31: "PeriodicReport2 — периодический отчёт по номерам",
-	33: "GetBox — сумма наличных в денежном ящике",
-	34: "ProgArt — программирование описания товара",
+	30: "PrintCopy — допечатать документ",
+	31: "PeriodicReport2 — периодический по номерам",
+	33: "GetBox — сумма в ящике",
+	34: "ProgArt — программирование товара",
 	35: "Discount — скидка или наценка",
-	42: "GetDayReport — прочитать данные дневного отчёта",
+	42: "GetDayReport — данные дневного отчёта",
 	43: "GetCheckSums — данные текущего чека",
-	44: "GetTaxRates — прочитать налоговые ставки",
-	45: "LoadBMP — загрузить логотип торговой точки",
-	46: "CplCutter — запрет/разрешение обрезчика",
+	44: "GetTaxRates — налоговые ставки",
+	45: "LoadBMP — логотип",
+	46: "CplCutter — обрезчик",
 	47: "SetBarCode — штрих-код чека",
-	48: "GetPapStat — состояние бумаги в принтере",
-	49: "ArtBarCode — штрих-код артикула в чеке",
-	52: "Personaliz — персонализация ЭККР",
-	53: "ModemPar — параметры/обмен модема (КСЕФ, эквайер)",
-	54: "SetIndType — протокол индикатора клиента",
-	58: "Cmd58 — (не документирована в EP-08)",
+	48: "GetPapStat — состояние бумаги",
+	49: "ArtBarCode — штрих-код артикула",
+	52: "Personaliz — персонализация",
+	53: "ModemPar — модем / КСЕФ / эквайер",
+	54: "SetIndType — протокол индикатора",
+	58: "Cmd58 — (нет в EP-08)",
 }
 
-var ModemTags = map[int]string{
+var modemTags = map[int]string{
 	1:  "инициировать обмен с эквайером",
 	2:  "безусловный обмен с эквайером",
 	3:  "получить пакет КСЕФ",
@@ -66,8 +80,8 @@ var ModemTags = map[int]string{
 	10: "текущая задача модема",
 }
 
-var ModemErr = map[int]string{
-	0:   "OK",
+var modemErr = map[int]string{
+	0:   "OK / задача завершена успешно",
 	1:   "общая ошибка модема",
 	2:   "таймаут старта задачи",
 	3:   "нет записи персонализации в КСЕФ",
@@ -91,16 +105,108 @@ var ModemErr = map[int]string{
 	255: "общая ошибка модема",
 }
 
-// ========================= Вспомогательные функции =========================
+type bitName struct {
+	bit  int
+	name string
+}
 
-func hexTokensToBytes(tokens []string) []byte {
-	var out []byte
+var statusBits = []bitName{
+	{0, "сборы"}, {1, "режим_оплат"}, {2, "ящик_открыт"}, {3, "чек_выплат"},
+	{4, "НДС_добавляемый"}, {5, "смена_открыта"}, {6, "чек_открыт"},
+	{9, "логотип"}, {10, "запрет_обрезчика"}, {11, "служебный_отчет"},
+	{12, "фискализирован"}, {13, "авар_завершение"}, {14, "OnLine"},
+}
+
+var reserveBits = []bitName{
+	{4, "фискализирован"}, {5, "смена_открыта"}, {6, "чек_открыт"},
+	{1, "авария"}, {2, "нет_бумаги"}, {0, "принтер_не_готов"},
+}
+
+var resultNames = map[int]string{
+	0: "нормальное завершение",
+	1: "ошибка",
+	2: "закончилась бумага",
+	3: "ошибка принтера",
+}
+
+var payTypes = map[int]string{
+	0: "наличные", 1: "карта", 2: "кредит", 3: "чек", 4: "сертификат",
+}
+
+// CP866 → Unicode (базовая таблица для кириллицы)
+var cp866Table [256]rune
+var cp1251Table [256]rune
+
+func init() {
+	for i := 0; i < 128; i++ {
+		cp866Table[i] = rune(i)
+	}
+	// Cyrillic А-Я (0x80-0x9F)
+	cyrUpper := []rune("АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ")
+	for i, r := range cyrUpper {
+		cp866Table[0x80+i] = r
+	}
+	// а-п (0xA0-0xAF)
+	cyrLower1 := []rune("абвгдежзийклмноп")
+	for i, r := range cyrLower1 {
+		cp866Table[0xA0+i] = r
+	}
+	// р-я (0xE0-0xEF)
+	cyrLower2 := []rune("рстуфхцчшщъыьэюя")
+	for i, r := range cyrLower2 {
+		cp866Table[0xE0+i] = r
+	}
+	cp866Table[0xF0] = 'Ё'
+	cp866Table[0xF1] = 'ё'
+	// box drawing / extras often appear as-is; leave 0xB0-0xDF as latin1-ish
+	for i := 0xB0; i <= 0xDF; i++ {
+		cp866Table[i] = rune(i)
+	}
+
+	// Windows-1251
+	for i := 0; i < 128; i++ {
+		cp1251Table[i] = rune(i)
+	}
+	// Cyrillic in 1251: 0xC0-0xFF = А-я
+	cyr1251 := []rune("АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюя")
+	for i, r := range cyr1251 {
+		cp1251Table[0xC0+i] = r
+	}
+	cp1251Table[0xA8] = 'Ё'
+	cp1251Table[0xB8] = 'ё'
+	cp1251Table[0xB9] = '№'
+}
+
+// ========================= Утилиты =========================
+
+var (
+	reHexToken = regexp.MustCompile(`(?i)0x[0-9A-Fa-f]{1,2}|\b[0-9A-Fa-f]{2}\b`)
+	reURL      = regexp.MustCompile(`https?://[^\s\x00]+`)
+	reDigits   = regexp.MustCompile(`\d{8,10}`)
+	reData     = regexp.MustCompile(`Data:\s*(.*)$`)
+	reFuncID   = regexp.MustCompile(`func ID\s*=\s*(\d+)`)
+	reNUL      = regexp.MustCompile(`(?:\[NUL\]){2,}`)
+)
+
+func extractHexBytes(dataStr string) []byte {
+	tokens := reHexToken.FindAllString(dataStr, -1)
+	out := make([]byte, 0, len(tokens))
 	for _, t := range tokens {
+		v, err := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(t), "0x"), 16, 8)
+		if err == nil {
+			out = append(out, byte(v))
+		}
+	}
+	if len(out) > 0 {
+		return out
+	}
+	// fallback: split by space
+	for _, t := range strings.Fields(dataStr) {
 		t = strings.TrimSpace(t)
 		if strings.HasPrefix(strings.ToLower(t), "0x") {
-			val, err := strconv.ParseUint(t[2:], 16, 8)
+			v, err := strconv.ParseUint(t[2:], 16, 8)
 			if err == nil {
-				out = append(out, byte(val))
+				out = append(out, byte(v))
 			}
 		}
 	}
@@ -108,42 +214,33 @@ func hexTokensToBytes(tokens []string) []byte {
 }
 
 func cp866Decode(b []byte) string {
-	decoder := charmap.CodePage866.NewDecoder()
-	utf8Bytes, err := decoder.Bytes(b)
-	var s string
-	if err != nil {
-		// Fallback на Latin1 если кодировка не распозналась
-		s = string(b)
-	} else {
-		s = string(utf8Bytes)
-	}
-
 	var sb strings.Builder
-	for _, c := range s {
-		if (c >= 32 && c <= 126) || c == ' ' || c == '\t' || c >= 128 {
-			sb.WriteRune(c)
-		} else {
-			sb.WriteString(fmt.Sprintf("[%02X]", c))
+	for _, c := range b {
+		r := cp866Table[c]
+		if unicode.IsPrint(r) || r == ' ' || r == '\t' {
+			sb.WriteRune(r)
 		}
 	}
-	return sb.String()
+	return strings.TrimSpace(sb.String())
 }
 
 func leUint(data []byte, signed bool) int64 {
 	if len(data) == 0 {
 		return 0
 	}
-	var val int64
-	for i, b := range data {
-		val |= int64(b) << uint(8*i)
-	}
+	// pad to 8 for simplicity
+	buf := make([]byte, 8)
+	copy(buf, data)
 	if signed {
-		bitSize := uint(len(data) * 8)
-		if val&(1<<(bitSize-1)) != 0 {
-			val -= int64(1) << bitSize
+		n := int(len(data))
+		if n > 0 && data[n-1]&0x80 != 0 {
+			for i := n; i < 8; i++ {
+				buf[i] = 0xFF
+			}
 		}
+		return int64(binary.LittleEndian.Uint64(buf))
 	}
-	return val
+	return int64(binary.LittleEndian.Uint64(buf))
 }
 
 func moneyStr(kopecks int64) string {
@@ -155,119 +252,32 @@ func moneyStr(kopecks int64) string {
 	return fmt.Sprintf("%s%d.%02d", sign, kopecks/100, kopecks%100)
 }
 
-func collapseNulsAndCtrl(text string) string {
-	// Схлопывание [NUL]
-	reNul := regexp.MustCompile(`(?:\[NUL\]){2,}`)
-	text = reNul.ReplaceAllStringFunc(text, func(m string) string {
-		n := strings.Count(m, "[NUL]")
-		if n > 1 {
-			return fmt.Sprintf("[NUL×%d]", n)
+func flagsFromConf(conf int, bits []bitName) string {
+	var flags []string
+	for _, bn := range bits {
+		if conf&(1<<bn.bit) != 0 {
+			flags = append(flags, bn.name)
 		}
-		return "[NUL]"
-	})
-
-	// Схлопывание [00]
-	re00 := regexp.MustCompile(`(?:\[00\]){2,}`)
-	text = re00.ReplaceAllStringFunc(text, func(m string) string {
-		n := len(m) / 4
-		if n > 1 {
-			return fmt.Sprintf("[00×%d]", n)
-		}
-		return "[00]"
-	})
-
-	// Удаление хвостовых нулей
-	reTailNul := regexp.MustCompile(`(?:\s*\[NUL(?:×\d+)?\])+\s*$`)
-	text = reTailNul.ReplaceAllString(text, "")
-	reTail00 := regexp.MustCompile(`(?:\s*\[00(?:×\d+)?\])+\s*$`)
-	text = reTail00.ReplaceAllString(text, "")
-
-	return strings.TrimSpace(text)
+	}
+	if len(flags) == 0 {
+		return "нет"
+	}
+	return strings.Join(flags, ", ")
 }
 
-func countNonzero(data []byte) int {
-	count := 0
-	for _, b := range data {
-		if b != 0 {
-			count++
-		}
-	}
-	return count
+type packetInfo struct {
+	start, end int
+	payload    []byte
 }
 
-func smartBytesToText(data []byte, collapse bool) string {
-	if len(data) == 0 {
-		return ""
-	}
-
-	var result []string
-	i := 0
-	for i < len(data) {
-		// Длинные ASCII фрагменты
-		if data[i] >= 32 && data[i] <= 126 {
-			j := i
-			for j < len(data) && data[j] >= 32 && data[j] <= 126 {
-				j++
-			}
-			if j-i >= 6 {
-				result = append(result, string(data[i:j]))
-				i = j
-				continue
-			}
-		}
-
-		b := data[i]
-		switch {
-		case b == 0x00:
-			result = append(result, "[NUL]")
-		case b == 0x20:
-			result = append(result, " ")
-		case b >= 32 && b <= 126:
-			result = append(result, string(rune(b)))
-		case b >= 0x80:
-			decoder := charmap.CodePage866.NewDecoder()
-			decodedChar, err := decoder.Bytes([]byte{b})
-			if err == nil && len(decodedChar) == 1 && decodedChar[0] >= 32 {
-				result = append(result, string(decodedChar))
-			} else {
-				result = append(result, fmt.Sprintf("[%02X]", b))
-			}
-		default:
-			ctrlMap := map[byte]string{
-				0x02: "STX", 0x03: "ETX", 0x05: "ENQ", 0x06: "ACK",
-				0x10: "DLE", 0x11: "DC1", 0x12: "DC2", 0x15: "NAK",
-				0x16: "SYN", 0x17: "ETB", 0x1B: "ESC", 0x1C: "FS",
-				0x1D: "GS", 0x1E: "RS", 0x1F: "US",
-			}
-			name, ok := ctrlMap[b]
-			if !ok {
-				name = fmt.Sprintf("%02X", b)
-			}
-			result = append(result, "["+name+"]")
-		}
-		i++
-	}
-
-	text := strings.Join(result, "")
-	reSpaces := regexp.MustCompile(`[ \t]+`)
-	text = strings.TrimSpace(reSpaces.ReplaceAllString(text, " "))
-	if collapse {
-		text = collapseNulsAndCtrl(text)
-	}
-	return text
-}
-
-// ========================= Разбор пакета =========================
-
-func findPacket(data []byte) (int, int, []byte) {
-	i := 0
-	for i < len(data)-3 {
+func findPacket(data []byte) *packetInfo {
+	for i := 0; i < len(data)-3; i++ {
 		if data[i] == 0x10 && data[i+1] == 0x02 {
-			var payload []byte
+			payload := make([]byte, 0, 64)
 			j := i + 2
 			for j < len(data)-1 {
 				if data[j] == 0x10 && data[j+1] == 0x03 {
-					return i, j + 2, payload
+					return &packetInfo{i, j + 2, payload}
 				}
 				if data[j] == 0x10 && j+1 < len(data) && data[j+1] == 0x10 {
 					payload = append(payload, 0x10)
@@ -279,165 +289,54 @@ func findPacket(data []byte) (int, int, []byte) {
 			}
 			break
 		}
-		i++
 	}
-	return -1, -1, nil
+	return nil
 }
 
-func cmdLabel(cmd int) string {
-	if name, ok := CmdNames[cmd]; ok {
-		return fmt.Sprintf("Cmd=%02X(%d/%s)", cmd, cmd, name)
-	}
-	return fmt.Sprintf("Cmd=%02X(%d)", cmd, cmd)
-}
-
-func decodeModemPar(data []byte, isResponse bool) string {
-	if len(data) == 0 {
-		return "[нет данных]"
-	}
-
-	if isResponse {
-		if len(data) >= 3 {
-			code := int(data[0])
-			n := int(leUint(data[1:3], false))
-			var payload []byte
-			if n > 0 && 3+n <= len(data) {
-				payload = data[3 : 3+n]
-			} else if 3 < len(data) {
-				payload = data[3:]
+func prefixInfo(raw []byte) (prefix []string, body []byte) {
+	pos := 0
+	for pos < len(raw) {
+		switch raw[pos] {
+		case 0x06:
+			prefix = append(prefix, "ACK")
+			pos++
+		case 0x16:
+			cnt := 0
+			for pos < len(raw) && raw[pos] == 0x16 {
+				cnt++
+				pos++
 			}
-
-			errStr := ModemErr[code]
-			if errStr == "" {
-				errStr = fmt.Sprintf("код=%d", code)
-			}
-			var parts []string
-			parts = append(parts, fmt.Sprintf("Result=%d(%s)", code, errStr))
-			if n > 0 {
-				parts = append(parts, fmt.Sprintf("Len=%d", n))
-			}
-			if len(payload) > 0 {
-				txt := smartBytesToText(payload, true)
-				if txt != "" {
-					parts = append(parts, fmt.Sprintf("Data: %s", txt))
-				}
-			}
-			return strings.Join(parts, " | ")
-		}
-		return smartBytesToText(data, true)
-	}
-
-	if len(data) >= 5 {
-		n := int(leUint(data[2:4], false))
-		tag := int(data[4])
-		tagName := ModemTags[tag]
-		if tagName == "" {
-			tagName = fmt.Sprintf("tag=%d", tag)
-		}
-		var rest []byte
-		if 5+max(0, n-1) <= len(data) && n > 0 {
-			rest = data[5 : 5+n-1]
-		} else if 5 < len(data) {
-			rest = data[5:]
-		}
-
-		var parts []string
-		parts = append(parts, fmt.Sprintf("Tag=%d(%s)", tag, tagName))
-		if n > 0 {
-			parts = append(parts, fmt.Sprintf("ParamLen=%d", n))
-		}
-		if len(rest) > 0 {
-			if tag == 3 && len(rest) >= 6 {
-				pkt := leUint(rest[0:4], false)
-				blk := leUint(rest[4:6], false)
-				parts = append(parts, fmt.Sprintf("PacketNo=%d Block=%d", pkt, blk))
-			} else if tag == 9 && len(rest) >= 5 {
-				zrep := leUint(rest[0:2], false)
-				ctype := rest[2]
-				chk := leUint(rest[3:5], false)
-				parts = append(parts, fmt.Sprintf("Z=%d CheckType=%d CheckNo=%d", zrep, ctype, chk))
+			if cnt > 1 {
+				prefix = append(prefix, fmt.Sprintf("%dxSYN", cnt))
 			} else {
-				parts = append(parts, smartBytesToText(rest, true))
+				prefix = append(prefix, "SYN")
 			}
+		case 0x15:
+			prefix = append(prefix, "NAK")
+			pos++
+		default:
+			return prefix, raw[pos:]
 		}
-		return strings.Join(parts, " | ")
 	}
-
-	return smartBytesToText(data, true)
+	return prefix, raw[pos:]
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
+// ========================= Разбор команд =========================
 
-func decodeDiscount(data []byte, isResponse bool) string {
-	if isResponse {
-		if len(data) >= 4 {
-			val := leUint(data[0:4], true)
-			if val > 1000000000 || val < -1000000000 {
-				return smartBytesToText(data, true)
+func decodeStatus(data []byte, isResp bool) []string {
+	var lines []string
+	if !isResp || len(data) < 2 {
+		if len(data) > 0 {
+			t := cp866Decode(data)
+			if t == "" {
+				t = fmt.Sprintf("% x", data)
 			}
-			rest := data[4:]
-			s := fmt.Sprintf("Amount=%s", moneyStr(val))
-			if len(rest) > 0 {
-				if t := smartBytesToText(rest, true); t != "" {
-					s += " " + t
-				}
-			}
-			return s
+			lines = append(lines, "Data: "+t)
 		}
-		return smartBytesToText(data, true)
+		return lines
 	}
-
-	if len(data) >= 5 {
-		status := data[0]
-		amount := leUint(data[1:5], true)
-		if amount > 1000000000 || amount < -1000000000 {
-			return smartBytesToText(data, true)
-		}
-		rest := data[5:]
-		s := fmt.Sprintf("Status=%02X Discount=%s", status, moneyStr(amount))
-		if len(rest) > 0 {
-			if t := smartBytesToText(rest, true); t != "" {
-				s += " " + t
-			}
-		}
-		return s
-	}
-	return smartBytesToText(data, true)
-}
-
-func decodeStatus(data []byte, isResponse bool) string {
-	if !isResponse || len(data) < 2 {
-		return smartBytesToText(data, true)
-	}
-
-	conf := uint16(leUint(data[0:2], false))
-	var flags []string
-	bitNames := [][2]interface{}{
-		{0, "сборы"}, {1, "режим_оплат"}, {2, "ящик_открыт"}, {3, "чек_выплат"},
-		{4, "НДС_добавляемый"}, {5, "смена_открыта"}, {6, "чек_открыт"},
-		{9, "логотип"}, {10, "запрет_обрезчика"}, {11, "служебный_отчет"},
-		{12, "фискализирован"}, {13, "авар_завершение"}, {14, "OnLine"},
-	}
-	for _, bn := range bitNames {
-		bit := bn[0].(int)
-		name := bn[1].(string)
-		if conf&(1<<uint(bit)) != 0 {
-			flags = append(flags, name)
-		}
-	}
-
-	var parts []string
-	flagStr := "нет"
-	if len(flags) > 0 {
-		flagStr = strings.Join(flags, ", ")
-	}
-	parts = append(parts, fmt.Sprintf("Flags=[%s]", flagStr))
-
+	conf := int(leUint(data[0:2], false))
+	lines = append(lines, fmt.Sprintf("Flags=[%s] (0x%04X)", flagsFromConf(conf, statusBits), conf))
 	pos := 2
 	if pos < len(data) && (data[pos] == 0x11 || data[pos] == 0x12) {
 		pos++
@@ -446,31 +345,30 @@ func decodeStatus(data []byte, isResponse bool) string {
 	if serialEnd > len(data) {
 		serialEnd = len(data)
 	}
-	rawSerial := data[pos:serialEnd]
-	reCtrl := regexp.MustCompile(`[\x00-\x1f]`)
-	serial := strings.TrimSpace(reCtrl.ReplaceAllString(cp866Decode(rawSerial), ""))
+	serial := cp866Decode(data[pos:serialEnd])
 	if serial != "" {
-		parts = append(parts, fmt.Sprintf("SN='%s'", serial))
+		lines = append(lines, fmt.Sprintf("SN='%s'", serial))
 	}
-
 	rest := data[serialEnd:]
 	if len(rest) > 0 {
-		if t := smartBytesToText(rest, true); t != "" {
-			parts = append(parts, t)
+		txt := cp866Decode(rest)
+		if txt != "" {
+			txt = safeTruncate(txt, 120)
+			lines = append(lines, "Info: "+txt)
 		}
 	}
-	return strings.Join(parts, " | ")
+	return lines
 }
 
-func decodeComment(data []byte, isResponse bool) string {
-	if isResponse {
-		return smartBytesToText(data, true)
+func decodeComment(data []byte, isResp bool) []string {
+	if isResp {
+		return nil
 	}
 	if len(data) == 0 {
-		return "[пусто]"
+		return []string{"[пусто]"}
 	}
 	n := int(data[0] & 0x7F)
-	openPayout := (data[0] & 0x80) != 0
+	openPayout := data[0]&0x80 != 0
 	text := ""
 	if n > 0 && 1+n <= len(data) {
 		text = cp866Decode(data[1 : 1+n])
@@ -479,42 +377,65 @@ func decodeComment(data []byte, isResponse bool) string {
 	if openPayout {
 		flag = " [открытие чека выплат]"
 	}
-	return fmt.Sprintf("Len=%d%flag Text='%s'", n, flag, text)
+	return []string{fmt.Sprintf("Len=%d%s Text='%s'", n, flag, text)}
 }
 
-func decodeSale(data []byte, isResponse bool) string {
-	if isResponse {
+func decodeSale(data []byte, isResp bool) []string {
+	var lines []string
+	if isResp {
 		if len(data) >= 8 {
 			cost := leUint(data[0:4], true)
 			total := leUint(data[4:8], true)
-			return fmt.Sprintf("Cost=%s TotalCheck=%s", moneyStr(cost), moneyStr(total))
+			lines = append(lines, fmt.Sprintf("стоимость=%s  сумма_по_чеку=%s", moneyStr(cost), moneyStr(total)))
 		}
-		return smartBytesToText(data, true)
+		return lines
 	}
-
 	if len(data) < 10 {
-		return smartBytesToText(data, true)
+		return []string{fmt.Sprintf("Raw: % x", data)}
 	}
-
-	qtyRaw := leUint(data[0:3], false)
+	qty := leUint(data[0:3], false)
 	status := data[3]
 	decimals := int(status & 0x0F)
-	printBarcode := (status & 0x40) != 0
-	noPrintQty1 := (status & 0x80) != 0
+	printBarcode := status&0x40 != 0
+	noPrintQty1 := status&0x80 != 0
 	price := leUint(data[4:8], true)
 	tax := data[8]
-	taxCh := fmt.Sprintf("%02X", tax)
-	if tax >= 0x80 && tax <= 0x85 {
-		taxCh = string(rune(tax)) // Приближенная замена для вывода символа ставки
+	var taxCh string
+	switch {
+	case tax >= 0x80 && tax <= 0x85:
+		taxCh = string(rune('А') + rune(tax-0x80))
+	case tax >= 0x41 && tax <= 0x45:
+		taxCh = string(tax)
+	default:
+		taxCh = fmt.Sprintf("%02X", tax)
 	}
 	nameLen := int(data[9])
 	name := ""
+	offset := 10
 	if nameLen == 255 {
 		name = "[из памяти]"
-	} else if nameLen > 0 && 10+nameLen <= len(data) {
-		name = cp866Decode(data[10 : 10+nameLen])
+	} else if nameLen > 0 && offset+nameLen <= len(data) {
+		name = cp866Decode(data[offset : offset+nameLen])
+		offset += nameLen
 	}
-
+	rest := data[offset:]
+	uktzed := ""
+	if len(rest) > 0 {
+		txt := cp866Decode(rest)
+		if m := reDigits.FindString(txt); m != "" {
+			uktzed = m
+		}
+	}
+	var qtyF float64
+	if decimals > 0 {
+		div := 1.0
+		for i := 0; i < decimals; i++ {
+			div *= 10
+		}
+		qtyF = float64(qty) / div
+	} else {
+		qtyF = float64(qty)
+	}
 	var flags []string
 	if printBarcode {
 		flags = append(flags, "штрих-код")
@@ -522,48 +443,54 @@ func decodeSale(data []byte, isResponse bool) string {
 	if noPrintQty1 {
 		flags = append(flags, "не_печ_кол=1")
 	}
+	lines = append(lines, fmt.Sprintf("название: «%s»", name))
 	flagStr := ""
 	if len(flags) > 0 {
-		flagStr = fmt.Sprintf(" [%s]", strings.Join(flags, ", "))
+		flagStr = " (" + strings.Join(flags, ", ") + ")"
 	}
-
-	div := 1.0
-	for k := 0; k < decimals; k++ {
-		div *= 10.0
+	fmtQty := fmt.Sprintf("%.*f", decimals, qtyF)
+	lines = append(lines, fmt.Sprintf("количество=%s  статус=0x%02X%s", fmtQty, status, flagStr))
+	lines = append(lines, fmt.Sprintf("цена=%s  налоговая_группа=%s", moneyStr(price), taxCh))
+	if uktzed != "" {
+		lines = append(lines, "УКТЗЕД: "+uktzed)
 	}
-	qtyVal := float64(qtyRaw) / div
-	qtyFormat := fmt.Sprintf("%%.%df", decimals)
-
-	return fmt.Sprintf("Qty="+qtyFormat+" Price=%s Tax=%s Name='%s'%s",
-		qtyVal, moneyStr(price), taxCh, name, flagStr)
+	return lines
 }
 
-func decodePayment(data []byte, isResponse bool) string {
-	if isResponse {
+func decodePayment(data []byte, isResp bool) []string {
+	var lines []string
+	if isResp {
 		if len(data) >= 8 {
-			restValSigned := leUint(data[0:4], true)
+			rest := leUint(data[0:4], true)
 			packetNo := leUint(data[4:8], false)
-			isChange := (restValSigned & 0x80000000) != 0
-			restVal := restValSigned & 0x7FFFFFFF
-			label := "Остаток"
+			isChange := rest&0x80000000 != 0
+			restVal := rest & 0x7FFFFFFF
+			label := "остаток_к_оплате"
 			if isChange {
-				label = "Сдача"
+				label = "сдача"
 			}
-			return fmt.Sprintf("%s=%s PacketNo=%d", label, moneyStr(restVal), packetNo)
+			lines = append(lines, fmt.Sprintf("%s=%s  номер_пакета_КЛЕФ=%d", label, moneyStr(restVal), packetNo))
+			if packetNo != 0 && restVal == 0 {
+				lines = append(lines, "-> ЧЕК ЗАКРЫТ И ЗАРЕГИСТРИРОВАН")
+			}
 		}
-		return smartBytesToText(data, true)
+		txt := cp866Decode(data)
+		if strings.Contains(txt, "https://") || strings.Contains(txt, "cabinet.tax") {
+			if m := reURL.FindString(txt); m != "" {
+				lines = append(lines, m)
+			}
+		}
+		return lines
 	}
-
 	if len(data) < 6 {
-		return smartBytesToText(data, true)
+		return []string{fmt.Sprintf("Raw: % x", data)}
 	}
-
 	status := data[0]
-	payType := status & 0x0F
-	nonfiscal := (status & 0x40) != 0
-	amountSigned := leUint(data[1:5], true)
-	autoClose := (amountSigned & 0x80000000) != 0
-	amountVal := amountSigned & 0x7FFFFFFF
+	payType := int(status & 0x0F)
+	nonfiscal := status&0x40 != 0
+	amount := leUint(data[1:5], true)
+	autoClose := amount&0x80000000 != 0
+	amountVal := amount & 0x7FFFFFFF
 	authLen := 0
 	if len(data) > 6 {
 		authLen = int(data[6])
@@ -572,13 +499,10 @@ func decodePayment(data []byte, isResponse bool) string {
 	if authLen > 0 && 7+authLen <= len(data) {
 		auth = cp866Decode(data[7 : 7+authLen])
 	}
-
-	types := map[byte]string{0: "наличные", 1: "карта", 2: "кредит", 3: "чек", 4: "сертификат"}
-	tname, ok := types[payType]
+	tname, ok := payTypes[payType]
 	if !ok {
 		tname = fmt.Sprintf("тип=%d", payType)
 	}
-
 	var flags []string
 	if nonfiscal {
 		flags = append(flags, "нефискальный")
@@ -588,306 +512,527 @@ func decodePayment(data []byte, isResponse bool) string {
 	}
 	flagStr := ""
 	if len(flags) > 0 {
-		flagStr = fmt.Sprintf(" [%s]", strings.Join(flags, ", "))
+		flagStr = " [" + strings.Join(flags, ", ") + "]"
 	}
-
-	return fmt.Sprintf("Type=%s Amount=%s%s Auth='%s'", tname, moneyStr(amountVal), flagStr, auth)
+	lines = append(lines, fmt.Sprintf("Type=%s Amount=%s%s", tname, moneyStr(amountVal), flagStr))
+	if auth != "" {
+		lines = append(lines, fmt.Sprintf("Auth/RRN='%s'", auth))
+	}
+	return lines
 }
 
-func decodeAvans(data []byte, isResponse bool) string {
-	if isResponse && len(data) >= 4 {
-		return fmt.Sprintf("PacketNo=%d", leUint(data[0:4], false))
+func decodeDiscount(data []byte, isResp bool) []string {
+	if isResp {
+		if len(data) >= 4 {
+			val := leUint(data[0:4], true)
+			if abs64(val) < 10_000_000_00 {
+				return []string{fmt.Sprintf("Amount=%s", moneyStr(val))}
+			}
+		}
+		return nil
 	}
-	if len(data) >= 4 {
-		return fmt.Sprintf("Avans=%s", moneyStr(leUint(data[0:4], true)))
-	}
-	return smartBytesToText(data, true)
-}
-
-func decodeDisplayOrText(data []byte) string {
-	if len(data) > 0 && data[0] > 0 && data[0] < 0x40 {
-		n := int(data[0])
-		if 1+n <= len(data) {
-			return fmt.Sprintf("Len=%d Text='%s'", n, cp866Decode(data[1:1+n]))
+	if len(data) >= 5 {
+		status := data[0]
+		amount := leUint(data[1:5], true)
+		if abs64(amount) < 10_000_000_00 {
+			return []string{fmt.Sprintf("Status=0x%02X Discount=%s", status, moneyStr(amount))}
 		}
 	}
-	return fmt.Sprintf("Text='%s'", cp866Decode(data))
+	return []string{fmt.Sprintf("Raw: % x", data)}
 }
 
-func decodeCmdData(cmd int, data []byte, isResponse bool) string {
+func abs64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func decodeModemPar(data []byte, isResp bool) []string {
+	var lines []string
 	if len(data) == 0 {
-		return "[нет данных]"
+		return []string{"[нет данных]"}
 	}
-
-	switch cmd {
-	case 0:
-		return decodeStatus(data, isResponse)
-	case 11:
-		return decodeComment(data, isResponse)
-	case 12, 18:
-		return decodeSale(data, isResponse)
-	case 14, 20:
-		return decodePayment(data, isResponse)
-	case 16:
-		return decodeAvans(data, isResponse)
-	case 23, 35:
-		return decodeDiscount(data, isResponse)
-	case 27:
-		return decodeDisplayOrText(data)
-	case 53:
-		return decodeModemPar(data, isResponse)
-	default:
-		return fmt.Sprintf("Data: %s", smartBytesToText(data, true))
-	}
-}
-
-func parseCommandPayload(payload []byte, isResponse bool) string {
-	if len(payload) < 3 {
-		return fmt.Sprintf("[слишком короткий payload: %X]", payload)
-	}
-
-	seq := payload[0]
-	cmd := int(payload[1])
-	var parts []string
-	parts = append(parts, fmt.Sprintf("Seq=%02X", seq))
-	parts = append(parts, cmdLabel(cmd))
-
-	if isResponse && len(payload) >= 6 {
-		status := payload[2]
-		result := payload[3]
-		reserve := payload[4]
-		data := payload[5 : len(payload)-1]
-		cs := payload[len(payload)-1]
-
-		parts = append(parts, fmt.Sprintf("Status=%02X", status))
-		parts = append(parts, fmt.Sprintf("Result=%02X", result))
-		if reserve != 0 {
-			parts = append(parts, fmt.Sprintf("Res=%02X", reserve))
-		}
-		parts = append(parts, fmt.Sprintf("CS=%02X", cs))
-		decoded := decodeCmdData(cmd, data, true)
-		parts = append(parts, decoded)
-	} else {
-		params := payload[2 : len(payload)-1]
-		cs := payload[len(payload)-1]
-		parts = append(parts, fmt.Sprintf("CS=%02X", cs))
-		decoded := decodeCmdData(cmd, params, false)
-		parts = append(parts, decoded)
-	}
-
-	return strings.Join(parts, " | ")
-}
-
-// ========================= Обработчик строки =========================
-
-func smartDecodeLine(dataContent string, isRcv bool) string {
-	tokens := strings.Fields(dataContent)
-	totalBytes := len(tokens)
-
-	last := totalBytes - 1
-	for last >= 0 {
-		t := strings.ToLower(tokens[last])
-		if t == "0x00" || t == "0x0" || t == "0xff" || t == "0x0ff" {
-			last--
-		} else {
-			break
-		}
-	}
-	var meaningful []string
-	if last >= 0 {
-		meaningful = tokens[:last+1]
-	} else {
-		meaningful = tokens
-	}
-
-	raw := hexTokensToBytes(meaningful)
-	if len(raw) == 0 {
-		collapsed := collapseNulsAndCtrl(dataContent)
-		nulCount := strings.Count(dataContent, "[NUL]")
-		nonzeroHint := ""
-		if nulCount > 0 {
-			nonzeroHint = fmt.Sprintf(", ненулевых≈%d", max(0, totalBytes-nulCount))
-		}
-		return fmt.Sprintf("Data: %s  [Размер: %dб%s]", collapsed, totalBytes, nonzeroHint)
-	}
-
-	var prefix []string
-	pos := 0
-	for pos < len(raw) {
-		if raw[pos] == 0x06 {
-			prefix = append(prefix, "ACK")
-			pos++
-		} else if raw[pos] == 0x16 {
-			cnt := 0
-			for pos < len(raw) && raw[pos] == 0x16 {
-				cnt++
-				pos++
+	if isResp {
+		if len(data) >= 3 {
+			code := int(data[0])
+			n := int(leUint(data[1:3], false))
+			var payload []byte
+			if n > 0 && 3+n <= len(data) {
+				payload = data[3 : 3+n]
+			} else if n > 0 {
+				payload = data[3:]
 			}
-			if cnt > 1 {
-				prefix = append(prefix, fmt.Sprintf("SYN×%d", cnt))
-			} else {
-				prefix = append(prefix, "SYN")
+			err, ok := modemErr[code]
+			if !ok {
+				err = fmt.Sprintf("код=%d", code)
 			}
-		} else if raw[pos] == 0x15 {
-			prefix = append(prefix, "NAK")
-			pos++
-		} else {
-			break
-		}
-	}
-	body := raw[pos:]
-	nonzero := countNonzero(body)
-
-	start, end, payload := findPacket(body)
-	if start != -1 {
-		isResp := isRcv || (len(payload) >= 6 && len(prefix) > 0)
-		decoded := parseCommandPayload(payload, isResp)
-		prefixStr := ""
-		if len(prefix) > 0 {
-			prefixStr = strings.Join(prefix, " ") + " "
-		}
-		rest := body[end:]
-		restStr := ""
-		if len(rest) > 0 {
-			restStr = fmt.Sprintf(" +CRC[%X]", rest)
-		}
-		sizeStr := fmt.Sprintf("[Размер: %dб, ненулевых: %d]", totalBytes, nonzero)
-		return fmt.Sprintf("Data: %s%s%s  %s", prefixStr, decoded, restStr, sizeStr)
-	}
-
-	prefixStr := ""
-	if len(prefix) > 0 {
-		prefixStr = strings.Join(prefix, " ") + " "
-	}
-	text := smartBytesToText(body, true)
-	sizeStr := fmt.Sprintf("[Размер: %dб, ненулевых: %d]", totalBytes, nonzero)
-	return fmt.Sprintf("Data: %s%s  %s", prefixStr, text, sizeStr)
-}
-
-func processFile(filepathIn, filepathOut string) error {
-	fmt.Printf("Обработка: %s → %s\n", filepathIn, filepathOut)
-	file, err := os.Open(filepathIn)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	var newLines []string
-	scanner := bufio.NewScanner(file)
-	reData := regexp.MustCompile(`Data:\s*(.*)`)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		isRcv := strings.Contains(line, "Rcv") || strings.Contains(strings.ToLower(line), "receive data")
-
-		processed := reData.ReplaceAllStringFunc(line, func(m string) string {
-			submatch := reData.FindStringSubmatch(m)
-			if len(submatch) > 1 {
-				decoded := smartDecodeLine(submatch[1], isRcv)
-				return decoded
+			lines = append(lines, fmt.Sprintf("код_результата_модема=%d (%s)", code, err))
+			if n > 0 {
+				lines = append(lines, fmt.Sprintf("длина_данных=%d", n))
 			}
-			return m
-		})
-		newLines = append(newLines, processed+"\n")
-	}
-
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-
-	outFile, err := os.Create(filepathOut)
-	if err != nil {
-		return err
-	}
-	defer outFile.Close()
-
-	writer := bufio.NewWriter(outFile)
-	for _, l := range newLines {
-		_, _ = writer.WriteString(l)
-	}
-	writer.Flush()
-
-	fmt.Printf("  OK, строк: %d\n", len(newLines))
-	return nil
-}
-
-// ========================= Main =========================
-
-func main() {
-	execPath, err := os.Executable()
-	if err != nil {
-		execPath = "."
-	}
-	scriptDir := filepath.Dir(execPath)
-
-	inputDir := filepath.Join(scriptDir, "log")
-	outDir := filepath.Join(scriptDir, "Decod_log")
-
-	if _, err := os.Stat(inputDir); os.IsNotExist(err) {
-		cwd, _ := os.Getwd()
-		inputDir = filepath.Join(cwd, "log")
-	}
-	if _, err := os.Stat(outDir); os.IsNotExist(err) {
-		outDir = filepath.Join(scriptDir, "Decod_log")
-		if _, err := os.Stat(scriptDir); os.IsNotExist(err) {
-			cwd, _ := os.Getwd()
-			outDir = filepath.Join(cwd, "Decod_log")
-		}
-	}
-
-	_ = os.MkdirAll(outDir, 0755)
-
-	var files []string
-	args := os.Args[1:]
-	if len(args) > 0 {
-		files = args
-	} else {
-		if matches, err := filepath.Glob(filepath.Join(inputDir, "*.log")); err == nil {
-			files = append(files, matches...)
-		}
-		if len(files) == 0 {
-			if matches, err := filepath.Glob("*.log"); err == nil {
-				for _, f := range matches {
-					if !strings.Contains(strings.ToLower(f), "_decoded") {
-						files = append(files, f)
+			if len(payload) > 0 {
+				if n == 4 {
+					lines = append(lines, fmt.Sprintf("номер_пакета_КСЕФ=%d", leUint(payload, false)))
+				} else {
+					txt := cp866Decode(payload)
+					if txt != "" && len(txt) > 3 {
+						txt = safeTruncate(txt, 100)
+						lines = append(lines, "Data: "+txt)
+					} else if n <= 20 {
+						lines = append(lines, fmt.Sprintf("Raw: % x", payload))
+					} else {
+						lines = append(lines, "структура состояния модема (формат в док. не раскрыт)")
 					}
 				}
 			}
 		}
+		return lines
 	}
-
-	var validFiles []string
-	for _, f := range files {
-		if info, err := os.Stat(f); err == nil && !info.IsDir() {
-			if !strings.Contains(strings.ToLower(filepath.Base(f)), "_decoded") {
-				validFiles = append(validFiles, f)
+	if len(data) >= 5 {
+		n := int(leUint(data[2:4], false))
+		tag := int(data[4])
+		tagName, ok := modemTags[tag]
+		if !ok {
+			tagName = fmt.Sprintf("tag=%d", tag)
+		}
+		var rest []byte
+		if n > 0 {
+			end := 5 + max(0, n-1)
+			if end > len(data) {
+				end = len(data)
+			}
+			rest = data[5:end]
+		} else {
+			rest = data[5:]
+		}
+		lines = append(lines, fmt.Sprintf("длина_параметров=%d  таг=%d (%s)", n, tag, tagName))
+		if tag == 3 && len(rest) >= 6 {
+			pkt := leUint(rest[0:4], false)
+			blk := leUint(rest[4:6], false)
+			lines = append(lines, fmt.Sprintf("номер_пакета_КСЕФ=%d  номер_блока=%d", pkt, blk))
+		} else if tag == 9 && len(rest) >= 5 {
+			zrep := leUint(rest[0:2], false)
+			ctype := rest[2]
+			chk := leUint(rest[3:5], false)
+			lines = append(lines, fmt.Sprintf("номер_Z=%d  тип_чека=%d  номер_чека=%d", zrep, ctype, chk))
+		} else if len(rest) > 0 {
+			txt := cp866Decode(rest)
+			if txt != "" {
+				txt = safeTruncate(txt, 80)
+				lines = append(lines, txt)
 			}
 		}
 	}
+	return lines
+}
 
-	if len(validFiles) == 0 {
-		fmt.Println("Лог-файлы не найдены.")
-		fmt.Printf("  Ожидаемая папка входа: %s\n", inputDir)
-		fmt.Printf("  Или укажите файл: go run main.go file.log\n")
-		return
+func decodeDisplay(data []byte) []string {
+	if len(data) > 0 && data[0] > 0 && data[0] < 0x40 {
+		n := int(data[0])
+		if 1+n <= len(data) {
+			return []string{fmt.Sprintf("Len=%d Text='%s'", n, cp866Decode(data[1:1+n]))}
+		}
+	}
+	return []string{fmt.Sprintf("Text='%s'", cp866Decode(data))}
+}
+
+func decodeAvans(data []byte, isResp bool) []string {
+	if isResp && len(data) >= 4 {
+		return []string{fmt.Sprintf("PacketNo=%d", leUint(data[0:4], false))}
+	}
+	if len(data) >= 4 {
+		return []string{fmt.Sprintf("Avans=%s", moneyStr(leUint(data[0:4], true)))}
+	}
+	return nil
+}
+
+func decodeCmdData(cmd int, data []byte, isResp bool) []string {
+	if len(data) == 0 && cmd != 0 && cmd != 9 && cmd != 13 && cmd != 15 {
+		return []string{"[нет данных]"}
+	}
+	defer func() {
+		_ = recover() // safety for edge cases
+	}()
+	switch cmd {
+	case 0:
+		return decodeStatus(data, isResp)
+	case 11:
+		return decodeComment(data, isResp)
+	case 12, 18:
+		return decodeSale(data, isResp)
+	case 14, 20:
+		return decodePayment(data, isResp)
+	case 16:
+		return decodeAvans(data, isResp)
+	case 23, 35:
+		return decodeDiscount(data, isResp)
+	case 27:
+		return decodeDisplay(data)
+	case 53:
+		return decodeModemPar(data, isResp)
+	case 9, 13, 15, 24, 29, 42, 43, 48:
+		if len(data) > 0 {
+			txt := cp866Decode(data)
+			if txt != "" {
+				txt = safeTruncate(txt, 100)
+				return []string{"Data: " + txt}
+			}
+			if len(data) <= 16 {
+				return []string{fmt.Sprintf("Raw: % x", data)}
+			}
+			if cmd == 42 && len(data) > 20 {
+				return []string{fmt.Sprintf("структура дневного отчёта, %d байт", len(data))}
+			}
+		}
+		return nil
+	default:
+		txt := cp866Decode(data)
+		if txt != "" && len(txt) > 2 {
+			txt = safeTruncate(txt, 100)
+			return []string{"Data: " + txt}
+		}
+		if len(data) > 0 && len(data) <= 24 {
+			return []string{fmt.Sprintf("Raw: % x", data)}
+		}
+		if len(data) > 0 {
+			return []string{fmt.Sprintf("[%d байт]", len(data))}
+		}
+		return nil
+	}
+}
+
+func parsePayload(payload []byte, isResp bool) []string {
+	var lines []string
+	if len(payload) < 2 {
+		lines = append(lines, fmt.Sprintf("[короткий payload: % x]", payload))
+		return lines
+	}
+	seq := int(payload[0])
+	cmd := int(payload[1])
+	name, ok := cmdNames[cmd]
+	if !ok {
+		name = fmt.Sprintf("Cmd=%d", cmd)
+	}
+	direction := "КОМАНДА"
+	if isResp {
+		direction = "ОТВЕТ  "
+	}
+	lines = append(lines, fmt.Sprintf("%s Код %d — %s   Номер=0x%02X", direction, cmd, name, seq))
+
+	if isResp && len(payload) >= 5 {
+		status := payload[2]
+		result := int(payload[3])
+		reserve := int(payload[4])
+		var data []byte
+		var cs byte
+		hasCS := false
+		if len(payload) > 5 {
+			data = payload[5 : len(payload)-1]
+			cs = payload[len(payload)-1]
+			hasCS = true
+		}
+		var stBits []string
+		if status&0x01 != 0 {
+			stBits = append(stBits, "принтер не готов")
+		}
+		if status&0x80 != 0 {
+			stBits = append(stBits, "команда запрещена/не существует в режиме")
+		}
+		stS := " [нет]"
+		if len(stBits) > 0 {
+			stS = " [" + strings.Join(stBits, ", ") + "]"
+		}
+		lines = append(lines, fmt.Sprintf("Статус=0x%02X%s", status, stS))
+		resName, ok := resultNames[result]
+		if !ok {
+			resName = strconv.Itoa(result)
+		}
+		lines = append(lines, fmt.Sprintf("Результат=%d [%s]", result, resName))
+		lines = append(lines, fmt.Sprintf("Резерв=0x%02X [%s]", reserve, flagsFromConf(reserve, reserveBits)))
+		if hasCS {
+			lines = append(lines, fmt.Sprintf("CS=0x%02X", cs))
+		}
+		lines = append(lines, decodeCmdData(cmd, data, true)...)
+	} else {
+		var params []byte
+		var cs byte
+		hasCS := false
+		if len(payload) > 3 {
+			params = payload[2 : len(payload)-1]
+			cs = payload[len(payload)-1]
+			hasCS = true
+		} else if len(payload) > 2 {
+			params = payload[2:]
+		}
+		if hasCS {
+			lines = append(lines, fmt.Sprintf("CS=0x%02X", cs))
+		}
+		lines = append(lines, decodeCmdData(cmd, params, false)...)
+	}
+	return lines
+}
+
+func decodeDataLine(dataStr string, isRcv bool) []string {
+	raw := extractHexBytes(dataStr)
+	if len(raw) == 0 {
+		collapsed := reNUL.ReplaceAllStringFunc(dataStr, func(m string) string {
+			n := strings.Count(m, "[NUL]")
+			return fmt.Sprintf("[NUL×%d]", n)
+		})
+		s := strings.TrimSpace(collapsed)
+		s = safeTruncate(s, 150)
+		return []string{"Data: " + s}
 	}
 
-	fmt.Printf("Вход:  %s\n", inputDir)
-	fmt.Printf("Выход: %s\n", outDir)
-	fmt.Printf("Файлов: %d\n", len(validFiles))
+	prefix, body := prefixInfo(raw)
+	var out []string
+	if len(prefix) > 0 {
+		out = append(out, "перед кадром: "+strings.Join(prefix, ", "))
+	}
 
-	for _, f := range validFiles {
-		base := filepath.Base(f)
-		ext := filepath.Ext(base)
-		name := strings.TrimSuffix(base, ext)
-		outName := fmt.Sprintf("%s_decoded%s", name, ext)
-		outPath := filepath.Join(outDir, outName)
+	pkt := findPacket(body)
+	if pkt != nil {
+		isResp := isRcv || len(prefix) > 0
+		out = append(out, parsePayload(pkt.payload, isResp)...)
+		rest := body[pkt.end:]
+		nonzero := false
+		for _, b := range rest {
+			if b != 0 {
+				nonzero = true
+				break
+			}
+		}
+		if nonzero {
+			if len(rest) == 2 {
+				out = append(out, fmt.Sprintf("CRC16=0x%02X%02X", rest[0], rest[1]))
+			} else {
+				out = append(out, fmt.Sprintf("+хвост % x", rest))
+			}
+		}
+	} else {
+		txt := cp866Decode(body)
+		if txt != "" {
+			txt = safeTruncate(txt, 120)
+			out = append(out, "Data: "+txt)
+		} else {
+			n := 40
+			if n > len(body) {
+				n = len(body)
+			}
+			out = append(out, fmt.Sprintf("Raw: % x...", body[:n]))
+		}
+	}
+	return out
+}
 
-		err := processFile(f, outPath)
-		if err != nil {
-			fmt.Printf("Ошибка %s: %v\n", f, err)
+// decodeLineToUTF8 converts a raw log line (often Windows-1251) to valid UTF-8.
+func decodeLineToUTF8(raw []byte) string {
+	// already valid UTF-8?
+	if utf8.Valid(raw) {
+		return string(raw)
+	}
+	// try Windows-1251 (typical for ICSFP logs with [ЕП-12])
+	var sb strings.Builder
+	sb.Grow(len(raw))
+	for _, c := range raw {
+		r := cp1251Table[c]
+		if r == 0 && c >= 0x80 {
+			r = rune(c)
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
+}
+
+// safeTruncate cuts s to at most n runes without splitting UTF-8 sequences.
+func safeTruncate(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}
+
+// ========================= Обработка файла =========================
+
+func processFile(filepathIn, outputPath string) error {
+	fmt.Printf("Обработка: %s\n  → %s\n", filepathIn, outputPath)
+	f, err := os.Open(filepathIn)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var lines []string
+	sc := bufio.NewScanner(f)
+	// large lines in logs
+	buf := make([]byte, 0, 1024*1024)
+	sc.Buffer(buf, 4*1024*1024)
+	for sc.Scan() {
+		lines = append(lines, decodeLineToUTF8(sc.Bytes()))
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+
+	var newLines []string
+	stats := struct {
+		snd, rcv int
+		cmds     map[int]int
+	}{cmds: map[int]int{}}
+
+	for _, rawLine := range lines {
+		// Только расшифровка, исходный hex не пишем
+		if strings.Contains(rawLine, "WAITING") {
+			ts := ""
+			if len(rawLine) >= 21 {
+				ts = strings.TrimRight(rawLine[:21], " ") + "  "
+			}
+			newLines = append(newLines, ts+"| ожидание ответа (ЭККР может слать SYN)\n")
+			continue
+		}
+
+		if !strings.Contains(rawLine, "Data:") {
+			continue
+		}
+
+		isRcv := strings.Contains(rawLine, "Rcv") || strings.Contains(strings.ToLower(rawLine), "receive data")
+		isSnd := strings.Contains(rawLine, "Snd")
+
+		ts := ""
+		if len(rawLine) >= 21 {
+			ts = strings.TrimRight(rawLine[:21], " ") + "  "
+		}
+		dir := "-->"
+		if isRcv {
+			dir = "<--"
+		}
+
+		m := reData.FindStringSubmatch(rawLine)
+		if m == nil {
+			continue
+		}
+		dataContent := m[1]
+		var decoded []string
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					decoded = []string{fmt.Sprintf("[ошибка: %v]", r)}
+				}
+			}()
+			decoded = decodeDataLine(dataContent, isRcv)
+		}()
+		if len(decoded) == 0 {
+			continue
+		}
+
+		pad := strings.Repeat(" ", len([]rune(ts)))
+		newLines = append(newLines, fmt.Sprintf("%s%s %s\n", ts, dir, decoded[0]))
+		for _, d := range decoded[1:] {
+			newLines = append(newLines, fmt.Sprintf("%s   %s\n", pad, d))
+		}
+		newLines = append(newLines, "\n")
+
+		if isSnd {
+			stats.snd++
+		}
+		if isRcv {
+			stats.rcv++
+		}
+		if fm := reFuncID.FindStringSubmatch(rawLine); fm != nil {
+			c, _ := strconv.Atoi(fm[1])
+			stats.cmds[c]++
 		}
 	}
 
+	var header []string
+	header = append(header,
+		"РАСШИФРОВКА ЛОГА ОБМЕНА ПК <-> ЭККР ІКС-Е810Т\n",
+		strings.Repeat("=", 80)+"\n",
+		fmt.Sprintf("Исходный файл : %s\n", filepath.Base(filepathIn)),
+		fmt.Sprintf("Строк исходных: %d\n", len(lines)),
+		fmt.Sprintf("Snd: %d  Rcv: %d\n", stats.snd, stats.rcv),
+		"Команды (по func ID):\n",
+	)
+	var codes []int
+	for c := range stats.cmds {
+		codes = append(codes, c)
+	}
+	sort.Ints(codes)
+	for _, c := range codes {
+		name := cmdNames[c]
+		header = append(header, fmt.Sprintf("  Код %3d  %5d   %s\n", c, stats.cmds[c], name))
+	}
+	header = append(header,
+		strings.Repeat("=", 80)+"\n",
+		"Только расшифровка (исходный hex не сохраняется).\n",
+		strings.Repeat("=", 80)+"\n\n",
+	)
+
+	out, err := os.Create(outputPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	w := bufio.NewWriter(out)
+	for _, h := range header {
+		w.WriteString(h)
+	}
+	for _, l := range newLines {
+		w.WriteString(l)
+	}
+	w.Flush()
+	fmt.Printf("  OK, строк выхода: %d\n", len(header)+len(newLines))
+	return nil
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func main() {
+	files := os.Args[1:]
+	if len(files) == 0 {
+		matches, _ := filepath.Glob("*.log")
+		matches2, _ := filepath.Glob("log/*.log")
+		files = append(matches, matches2...)
+		filtered := files[:0]
+		for _, f := range files {
+			base := strings.ToLower(filepath.Base(f))
+			if !strings.Contains(base, "_decoded") {
+				filtered = append(filtered, f)
+			}
+		}
+		files = filtered
+	}
+
+	if len(files) == 0 {
+		fmt.Println("Укажите .log файл: go run . file.log")
+		return
+	}
+
+	outDir := "Decod_log"
+	os.MkdirAll(outDir, 0o755)
+
+	for _, f := range files {
+		if fi, err := os.Stat(f); err != nil || fi.IsDir() {
+			fmt.Printf("Нет файла: %s\n", f)
+			continue
+		}
+		base := filepath.Base(f)
+		ext := filepath.Ext(base)
+		name := strings.TrimSuffix(base, ext)
+		out := filepath.Join(outDir, name+"_decoded_v2"+ext)
+		if err := processFile(f, out); err != nil {
+			fmt.Printf("Ошибка %s: %v\n", f, err)
+		}
+	}
 	fmt.Println("Готово.")
 }

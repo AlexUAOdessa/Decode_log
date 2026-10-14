@@ -548,6 +548,63 @@ func abs64(v int64) int64 {
 	return v
 }
 
+// printableRatio — доля печатных символов после CP866 (для отсечения бинарного мусора).
+func printableRatio(b []byte) float64 {
+	if len(b) == 0 {
+		return 0
+	}
+	ok := 0
+	for _, c := range b {
+		if c == 0 {
+			continue
+		}
+		r := cp866Table[c]
+		if (r >= 32 && r < 127) || (r >= 0x400 && r < 0x500) {
+			ok++
+		}
+	}
+	nonzero := 0
+	for _, c := range b {
+		if c != 0 {
+			nonzero++
+		}
+	}
+	if nonzero == 0 {
+		return 0
+	}
+	return float64(ok) / float64(nonzero)
+}
+
+// extractPrintableRuns — только читаемые фрагменты CP866, без бинарного шума.
+func extractPrintableRuns(b []byte) string {
+	var parts []string
+	var cur []rune
+	flush := func() {
+		if len(cur) >= 3 {
+			parts = append(parts, string(cur))
+		}
+		cur = cur[:0]
+	}
+	for _, c := range b {
+		if c == 0 {
+			flush()
+			continue
+		}
+		r := cp866Table[c]
+		if (r >= 32 && r < 127) || (r >= 0x400 && r < 0x500) || r == 'ё' || r == 'Ё' || r == '№' {
+			cur = append(cur, r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	if len(parts) == 0 {
+		return ""
+	}
+	out := strings.Join(parts, " | ")
+	return safeTruncate(out, 120)
+}
+
 func decodeModemPar(data []byte, isResp bool) []string {
 	var lines []string
 	if len(data) == 0 {
@@ -574,15 +631,17 @@ func decodeModemPar(data []byte, isResp bool) []string {
 			if len(payload) > 0 {
 				if n == 4 {
 					lines = append(lines, fmt.Sprintf("номер_пакета_КСЕФ=%d", leUint(payload, false)))
+				} else if n >= 100 && printableRatio(payload) < 0.45 {
+					// бинарная структура модема / служебные блоки — не гоняем через CP866
+					lines = append(lines, fmt.Sprintf("бинарные данные %d байт (структура модема/КСЕФ, не текст)", n))
 				} else {
-					txt := cp866Decode(payload)
-					if txt != "" && len(txt) > 3 {
-						txt = safeTruncate(txt, 100)
-						lines = append(lines, "Data: "+txt)
-					} else if n <= 20 {
+					txt := extractPrintableRuns(payload)
+					if txt != "" {
+						lines = append(lines, "Текст: "+txt)
+					} else if n <= 16 {
 						lines = append(lines, fmt.Sprintf("Raw: % x", payload))
 					} else {
-						lines = append(lines, "структура состояния модема (формат в док. не раскрыт)")
+						lines = append(lines, fmt.Sprintf("бинарные данные %d байт", n))
 					}
 				}
 			}
